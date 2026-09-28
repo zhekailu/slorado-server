@@ -63,6 +63,7 @@ OBJ = $(BUILD_DIR)/main.o \
 # add more objects here if needed
 SERVER_OBJ = $(BUILD_DIR)/server_main.o \
 	 $(BUILD_DIR)/socket.o \
+	 $(BUILD_DIR)/protocol.o \
       $(BUILD_DIR)/slorado.o \
       $(BUILD_DIR)/thread.o \
 	  $(BUILD_DIR)/misc.o \
@@ -80,7 +81,8 @@ SERVER_OBJ = $(BUILD_DIR)/server_main.o \
 	  $(BUILD_DIR)/toml.o \
 
 CLIENT_OBJ = $(BUILD_DIR)/client_main.o \
-	  $(BUILD_DIR)/socket.o
+	  $(BUILD_DIR)/socket.o \
+	  $(BUILD_DIR)/protocol.o
 
 
 VERSION = `git describe --tags`
@@ -187,17 +189,20 @@ openfish/lib/libopenfish.a:
 slow5lib/lib/libslow5.a:
 	$(MAKE) -C slow5lib zstd=$(zstd) no_simd=$(no_simd) zstd_local=$(zstd_local) lib/libslow5.a
 
-$(BUILD_DIR)/server_main.o: src-server/server_main.cpp src-server/socket.h
+$(BUILD_DIR)/server_main.o: src-server/server_main.cpp src-server/socket.h src-server/protocol.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(DEPFLAGS) $< -c -o $@
 
-$(BUILD_DIR)/client_main.o: src-server/client_main.cpp src-server/socket.h
+$(BUILD_DIR)/client_main.o: src-server/client_main.cpp src-server/socket.h src-server/protocol.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(DEPFLAGS) $< -c -o $@
 
 $(BUILD_DIR)/socket.o: src-server/socket.cpp src-server/socket.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(DEPFLAGS) $< -c -o $@
 
+$(BUILD_DIR)/protocol.o: src-server/protocol.cpp src-server/protocol.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(DEPFLAGS) $< -c -o $@
+
 clean:
-	rm -rf $(BINARY) $(SERVER_BINARY) $(BUILD_DIR)/*.o $(BUILD_DIR)/*.d
+	rm -rf $(BINARY) $(SERVER_BINARY) $(CLIENT_BINARY) $(BUILD_DIR)/*.o $(BUILD_DIR)/*.d
 	make -C slow5lib clean
 	make -C openfish clean
 
@@ -214,4 +219,4 @@ test: $(BINARY)
 mem: $(BINARY)
 	./test/test.sh mem
 
--include $(OBJ:.o=.d)
+-include $(OBJ:.o=.d) $(SERVER_OBJ:.o=.d) $(CLIENT_OBJ:.o=.d)
