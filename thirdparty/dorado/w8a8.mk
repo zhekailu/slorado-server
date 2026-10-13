@@ -10,8 +10,18 @@ $(BUILD_DIR)/QuantCRFModel.o: thirdparty/dorado/QuantCRFModel.cpp
 
 ifdef cuda
 NVCC      ?= $(CUDA_ROOT)/bin/nvcc
-# mma.sync m16n8k32 s8 needs sm_80+; compute_80 PTX JIT-compiles on any newer GPU
-W8A8_ARCH ?= $(if $(CUDA_ARCH),$(CUDA_ARCH),-gencode arch=compute_80,code=compute_80)
+# mma.sync m16n8k32 s8 needs sm_80+.  An explicit CUDA_ARCH wins; otherwise build for the GPU in
+# this machine (-arch=native, nvcc >= 11.5 with a visible GPU), else compute_80 PTX, which the
+# driver JIT-compiles on any newer GPU.
+ifeq ($(origin W8A8_ARCH),undefined)
+ifneq ($(CUDA_ARCH),)
+W8A8_ARCH := $(CUDA_ARCH)
+else ifeq ($(shell $(NVCC) -arch=native -x cu -c /dev/null -o /dev/null >/dev/null 2>&1 && echo ok),ok)
+W8A8_ARCH := -arch=native
+else
+W8A8_ARCH := -gencode arch=compute_80,code=compute_80
+endif
+endif
 W8A8_OBJ   = $(BUILD_DIR)/w8a8_fast.o $(BUILD_DIR)/w8a8_tanh_approx.o
 
 OBJ        += $(W8A8_OBJ)
