@@ -34,6 +34,7 @@ SOFTWARE.
 #include "torchbox.h"
 #include "dorado/tensor_chunk_utils.h"
 #include "dorado/CRFModel.h"
+#include "dorado/QuantCRFModel.h"
 #include "dorado/TxModel.h"
 #include "dorado/ModBaseModel.h"
 #include "dorado/modbase.h"
@@ -199,7 +200,9 @@ void init_runner(
         } else {
             LOG_TRACE("%s", "loading lstm model");
             lstm_stats_t *model_stats = init_lstm_stats();
-            runner->module = load_lstm_model(*core->model_config, runner->tensor_opts, model_stats);
+            runner->module = is_w8a8_model(core->model_config->model_path)
+                ? load_quant_lstm_model(*core->model_config, runner->tensor_opts, model_stats)
+                : load_lstm_model(*core->model_config, runner->tensor_opts, model_stats);
             (*core->runner_stats)[runner_idx]->model_stats = model_stats;
         }
     }

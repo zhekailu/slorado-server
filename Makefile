@@ -114,6 +114,9 @@ else ifdef rocm
 	LDFLAGS += -L$(ROCM_LIB) -lamdhip64 -lrt -ldl
 endif
 
+# W8A8 quantized model (QuantCRFModel + fused CUDA kernels)
+include thirdparty/dorado/w8a8.mk
+
 .PHONY: clean distclean test
 
 #include ""
