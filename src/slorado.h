@@ -187,7 +187,9 @@ typedef struct {
 typedef struct {
     double time_accept;
     double time_basecall;
+    double time_h2d;
     double time_infer;
+    double time_reshape;
     double time_decode;
     double time_modcall;
 

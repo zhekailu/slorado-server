@@ -38,7 +38,7 @@ server adds three of its own:
 
 | option | default | meaning |
 |---|---|---|
-| `--timing FILE` | off | Per-batch server-side TSV: recv, decode, preprocess, basecall, postprocess, fastq, send, and total ms. |
+| `--timing FILE` | off | Per-batch server-side TSV: recv, unpack, preprocess, load, copyToGPU, inference, reshape, decode, postprocess, fastq, send, and total ms. `unpack_ms` is request payload → SLOW5 records; `load_ms` copies chunks into the input tensor, `copyToGPU_ms` is the host→device copy, `inference_ms` the model forward pass, `reshape_ms` the score transpose, and `decode_ms` the CRF decode. |
 | `--min-samples INT` | 100 | Reads shorter than this are not basecalled and come back with an empty sequence. |
 | `--max-request-mib INT` | 256 | Largest request frame accepted. |
 

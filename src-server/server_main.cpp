@@ -50,9 +50,13 @@ typedef struct {
     uint64_t samples;
     uint64_t bases;
     double recv;        // fragment 0 received -> last fragment received
-    double decode;      // payload -> slow5_rec_t
+    double unpack;      // payload -> slow5_rec_t
     double preprocess;
-    double basecall;
+    double load;        // chunks -> runner input tensor, summed over runners
+    double h2d;         // input tensor host -> device copy, summed over runners
+    double inference;   // model forward pass, summed over runners
+    double reshape;     // scores transpose to TNC before decode, summed over runners
+    double decode;      // CRF beam-search decode of the scores, summed over runners
     double postprocess;
     double fastq;
     double send;
@@ -103,6 +107,21 @@ static double monotime(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* slorado's per-runner counters are cumulative; diffing them around basecall_db()
+   gives this batch's share. Summed over runners, so with one device it is wall time. */
+static runner_stat_t runner_times(const core_t *core) {
+    runner_stat_t sum;
+    memset(&sum, 0, sizeof(sum));
+    for (const runner_stat_t *ts : *core->runner_stats) {
+        sum.time_accept += ts->time_accept;
+        sum.time_h2d += ts->time_h2d;
+        sum.time_infer += ts->time_infer;
+        sum.time_reshape += ts->time_reshape;
+        sum.time_decode += ts->time_decode;
+    }
+    return sum;
 }
 
 /* init_core() insists on opening a slow5 file, so hand it a header-only BLOW5
@@ -179,12 +198,18 @@ static void basecall_batch(core_t *core, std::vector<slow5_rec_t *> &recs, const
         double a = monotime();
         work_db(core, db, preprocess_signal_db);
         double b = monotime();
+        runner_stat_t s0 = runner_times(core);
         basecall_db(core, db);
+        runner_stat_t s1 = runner_times(core);
         double c = monotime();
         work_db(core, db, postprocess_signal);
         double d = monotime();
         t->preprocess = b - a;
-        t->basecall = c - b;
+        t->load = s1.time_accept - s0.time_accept;
+        t->h2d = s1.time_h2d - s0.time_h2d;
+        t->inference = s1.time_infer - s0.time_infer;
+        t->reshape = s1.time_reshape - s0.time_reshape;
+        t->decode = s1.time_decode - s0.time_decode;
         t->postprocess = d - c;
     }
 
@@ -225,9 +250,11 @@ static void free_recs(std::vector<slow5_rec_t *> &recs) {
 }
 
 static void write_timing(FILE *fp, const batch_timing_t *t) {
-    fprintf(fp, "%u\t%u\t%u\t%u\t%lu\t%lu\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
+    fprintf(fp, "%u\t%u\t%u\t%u\t%lu\t%lu\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
             t->batch, t->fragments, t->reads, t->basecalled_reads, (unsigned long)t->samples, (unsigned long)t->bases,
-            t->recv * 1e3, t->decode * 1e3, t->preprocess * 1e3, t->basecall * 1e3, t->postprocess * 1e3,
+            t->recv * 1e3, t->unpack * 1e3, t->preprocess * 1e3, t->load * 1e3, t->h2d * 1e3,
+            t->inference * 1e3, t->reshape * 1e3, t->decode * 1e3,
+            t->postprocess * 1e3,
             t->fastq * 1e3, t->send * 1e3, t->total * 1e3);
 }
 
@@ -289,7 +316,7 @@ static int serve(int fd, core_t *core, const server_opt_t *sopt) {
         if (!error) {
             double a = monotime();
             error = nt_decode_reads(req.reads, req.reads_len, recs);
-            t.decode += monotime() - a;
+            t.unpack += monotime() - a;
         }
         free(raw);
 
@@ -325,9 +352,9 @@ static int serve(int fd, core_t *core, const server_opt_t *sopt) {
 
         if (sopt->timing != NULL) write_timing(sopt->timing, &t);
         if (get_log_level() >= LOG_DBUG) {
-            fprintf(stderr, "[%s] batch %u: %u reads (%u basecalled), %lu samples, %lu bases, %.1f ms (basecall %.1f ms)\n",
+            fprintf(stderr, "[%s] batch %u: %u reads (%u basecalled), %lu samples, %lu bases, %.1f ms (inference %.1f ms, decode %.1f ms)\n",
                     __func__, t.batch, t.reads, t.basecalled_reads, (unsigned long)t.samples, (unsigned long)t.bases,
-                    t.total * 1e3, t.basecall * 1e3);
+                    t.total * 1e3, t.inference * 1e3, t.decode * 1e3);
         }
     }
 }
@@ -453,8 +480,8 @@ int main(int argc, char* argv[]) {
         sopt.timing = fopen(timing_path, "w");
         F_CHK(sopt.timing, timing_path);
         setvbuf(sopt.timing, NULL, _IOLBF, 0); // the server is usually stopped with Ctrl-C, so keep rows flushed
-        fprintf(sopt.timing, "batch\tfragments\treads\tbasecalled_reads\tsamples\tbases\trecv_ms\tdecode_ms\t"
-                             "preprocess_ms\tbasecall_ms\tpostprocess_ms\tfastq_ms\tsend_ms\tserver_ms\n");
+        fprintf(sopt.timing, "batch\tfragments\treads\tbasecalled_reads\tsamples\tbases\trecv_ms\tunpack_ms\t"
+                             "preprocess_ms\tload_ms\tcopyToGPU_ms\tinference_ms\treshape_ms\tdecode_ms\tpostprocess_ms\tfastq_ms\tsend_ms\tserver_ms\n");
     }
 
     // load the model once; it is reused for every client and batch
