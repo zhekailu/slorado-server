@@ -13,8 +13,18 @@ NVCC      ?= $(CUDA_ROOT)/bin/nvcc
 # mma.sync m16n8k32 s8 needs sm_80+.  An explicit CUDA_ARCH wins; otherwise build for the GPU in
 # this machine (-arch=native, nvcc >= 11.5 with a visible GPU), else compute_80 PTX, which the
 # driver JIT-compiles on any newer GPU.
+#
+# w8a8_release=1 builds a binary for distribution instead: SASS for every sm_80+ family this
+# nvcc knows (Ampere, Orin, Ada, Hopper, Blackwell) plus compute_80 PTX, which the driver
+# JIT-compiles on any GPU newer than the list.
+comma := ,
+W8A8_RELEASE_SMS := 80 86 87 89 90 100 120
 ifeq ($(origin W8A8_ARCH),undefined)
-ifneq ($(CUDA_ARCH),)
+ifneq ($(w8a8_release),)
+W8A8_NVCC_ARCHS := $(shell $(NVCC) --list-gpu-arch 2>/dev/null)
+W8A8_ARCH := $(foreach s,$(W8A8_RELEASE_SMS),$(if $(filter compute_$(s),$(W8A8_NVCC_ARCHS)),-gencode arch=compute_$(s)$(comma)code=sm_$(s))) \
+             -gencode arch=compute_80,code=compute_80
+else ifneq ($(CUDA_ARCH),)
 W8A8_ARCH := $(CUDA_ARCH)
 else ifeq ($(shell $(NVCC) -arch=native -x cu -c /dev/null -o /dev/null >/dev/null 2>&1 && echo ok),ok)
 W8A8_ARCH := -arch=native

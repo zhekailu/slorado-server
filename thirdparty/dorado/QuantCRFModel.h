@@ -44,6 +44,7 @@ private:
 #endif
     float inv_sh_ = 1.0f, clamp_lo_ = 0.0f, clamp_hi_ = 0.0f;
     int device_idx_ = 0;
+    void *events_[4] = {};         // cudaEvent_t: stage boundaries for model_stats_ timing
     lstm_stats_t *model_stats_;
 };
 

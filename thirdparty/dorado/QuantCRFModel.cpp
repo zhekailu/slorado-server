@@ -234,6 +234,8 @@ QuantCRFModelImpl::QuantCRFModelImpl(const CRFModelConfig &config, const torch::
     front_.inv_c2 = 1.0f / s_c2;
     front_.inv_x0 = 1.0f / s_x0;
     front_.conv_clamp = json_required(json, "conv_clamp_max");
+
+    for (auto &e : events_) check_rc(cudaEventCreate(reinterpret_cast<cudaEvent_t *>(&e)), "cudaEventCreate");
 }
 
 torch::Tensor QuantCRFModelImpl::forward(const torch::Tensor &x_in) {
@@ -244,24 +246,25 @@ torch::Tensor QuantCRFModelImpl::forward(const torch::Tensor &x_in) {
     const int N = x.size(0);
     const int T = x.size(2);
     const int Tp = (T - 1) / 6 + 1;
-    double a, b;
 
     // The kernels run on this binary's (static) CUDA runtime, whose current device is
     // independent of libtorch's DeviceGuard
     cudaSetDevice(device_idx_);
-    void *stream = c10::cuda::getCurrentCUDAStream(device_idx_).stream();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device_idx_).stream();
+    cudaEvent_t ev[4];
+    for (int i = 0; i < 4; ++i) ev[i] = reinterpret_cast<cudaEvent_t>(events_[i]);
 
     // INT8 [T'][N][96] activations, ping-ponged between layers
     auto act = torch::empty({Tp, N, 96}, x.options().dtype(torch::kInt8));
     auto act_next = torch::empty_like(act);
+    // linear + clamp writes FP16 scores in TNC order
+    auto scores = torch::empty({Tp, N, 256}, x.options());
 
-    a = realtime();
+    // Stage times come from events, so the stages run back to back with one wait at the end
+    // (the caller synchronises after forward anyway).
+    check_rc(cudaEventRecord(ev[0], stream), "cudaEventRecord");
     check_rc(w8a8f_frontend(x.data_ptr(), act.data_ptr<int8_t>(), N, T, &front_, stream), "w8a8f_frontend");
-    torch::cuda::synchronize(device_idx_);
-    b = realtime();
-    model_stats_->time_conv_stack += b - a;
-
-    a = realtime();
+    check_rc(cudaEventRecord(ev[1], stream), "cudaEventRecord");
     for (size_t i = 0; i < lstm_frag_.size(); ++i) {
         // LSTMStack flips before every layer, so even layers run reversed
         const int reverse = (i & 1) == 0;
@@ -270,19 +273,18 @@ torch::Tensor QuantCRFModelImpl::forward(const torch::Tensor &x_in) {
                  "w8a8f_lstm");
         std::swap(act, act_next);
     }
-    torch::cuda::synchronize(device_idx_);
-    b = realtime();
-    model_stats_->time_rnns += b - a;
-
-    // linear + clamp writes FP16 scores in TNC order
-    auto scores = torch::empty({Tp, N, 256}, x.options());
-    a = realtime();
+    check_rc(cudaEventRecord(ev[2], stream), "cudaEventRecord");
     check_rc(w8a8f_linear(act.data_ptr<int8_t>(), scores.data_ptr(), (int64_t)Tp * N, linear_frag_.data_ptr<uint8_t>(),
                           linear_dq_.data_ptr<float>(), clamp_lo_, clamp_hi_, stream),
              "w8a8f_linear");
-    torch::cuda::synchronize(device_idx_);
-    b = realtime();
-    model_stats_->time_crf_1 += b - a;
+    check_rc(cudaEventRecord(ev[3], stream), "cudaEventRecord");
+    check_rc(cudaEventSynchronize(ev[3]), "cudaEventSynchronize");
+
+    float ms[3];
+    for (int i = 0; i < 3; ++i) check_rc(cudaEventElapsedTime(&ms[i], ev[i], ev[i + 1]), "cudaEventElapsedTime");
+    model_stats_->time_conv_stack += ms[0] / 1000.0;
+    model_stats_->time_rnns += ms[1] / 1000.0;
+    model_stats_->time_crf_1 += ms[2] / 1000.0;
 
     // Output is [N, T, C], non-contiguous; the caller's transpose(0, 1).contiguous() is free
     return scores.transpose(0, 1);

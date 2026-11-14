@@ -11,9 +11,10 @@
  *
  *   frontend  conv0 + conv1 + conv2 (+SiLU/clamp/quantize) for a tile of 64 output steps,
  *             all intermediates in shared memory; conv1/conv2 on INT8 tensor cores
- *   lstm      one LSTM layer, persistent: each warp owns 16 chunks for the whole sequence,
- *             weights stay in shared memory, h and c stay in registers; the x-path GEMM
- *             is done inside the recurrence, so gx never goes to memory
+ *   lstm      one LSTM layer, persistent: a group of 1, 2, 3 or 6 warps owns 16 chunks for the
+ *             whole sequence (more warps per tile for small batches, chosen from the batch size
+ *             and SM count), weights stay in shared memory, c stays in registers; the x-path
+ *             GEMM is done inside the recurrence, so gx never goes to memory
  *   linear    96 -> 256 + clamp, FP16 scores written in TNC order for the decoder
  *
  * Activations between kernels are INT8 [T'][N][96] in a "fragment" channel order: within
@@ -78,6 +79,11 @@ int w8a8f_frontend(const void *x, int8_t *out, int N, int T, const w8a8f_fronten
  * "nonlinearity": "tanh_approx".  Callers must check the model declares exactly that. */
 int w8a8f_lstm(const int8_t *x, int8_t *y, int N, int Tp, int reverse, const uint8_t *frag,
                const float *epi, float inv_sh, void *stream);
+
+/* Warps per 16-chunk tile in w8a8f_lstm: 1, 2, 3 or 6 forces that split, 0 (default) picks
+ * it from the batch size and SM count.  The output is identical for every split.  For tests
+ * and benchmarks; the environment variable SLORADO_W8A8_LSTM_SPLIT does the same. */
+void w8a8f_lstm_force_split(int split);
 
 /* h: INT8 [rows][96]  ->  out: FP16 [rows][256] = clamp(acc * dq, lo, hi) */
 int w8a8f_linear(const int8_t *h, void *out, int64_t rows, const uint8_t *frag, const float *dq,

@@ -18,6 +18,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+
 namespace {
 
 // ── primitives ──────────────────────────────────────────────────────────────
@@ -272,7 +274,14 @@ frontend_kernel(const __half *__restrict__ x, int8_t *__restrict__ out, int N, i
     }
 }
 
-// ── LSTM layer: persistent, 16 chunks per warp, weights in shared memory ──────────
+// ── LSTM layer: persistent, weights in shared memory ─────────────────────────────
+// A 16-chunk row tile is owned for the whole sequence by a group of S warps (S = 1, 2, 3, 6).
+// Warp s of the group computes hidden blocks [s * 12/S, (s+1) * 12/S): their x- and h-path
+// GEMMs, cell epilogue and c state.  S = 1 is the throughput layout (h stays in registers);
+// S > 1 cuts the serial work per timestep by S for small batches, where there are too few tiles
+// to fill the GPU and every step is latency-bound.  The S warps exchange h codes through a
+// double-buffered shared tile, so one named barrier per step suffices.  Every cell value is
+// computed by exactly the same operations whatever S is, so the output does not depend on S.
 #ifndef W8A8F_LSTM_WARPS
 #define W8A8F_LSTM_WARPS 8           // warps per CTA (one CTA per SM: the weights fill shared memory)
 #endif
@@ -281,15 +290,26 @@ frontend_kernel(const __half *__restrict__ x, int8_t *__restrict__ out, int N, i
 #endif
 constexpr int LSTM_MAX_WARPS = W8A8F_LSTM_WARPS;
 constexpr int LSTM_SMEM = W8A8F_LSTM_FRAG_BYTES + W8A8F_LSTM_EPI_FLOATS * 4;
+constexpr int LSTM_HTILE = 16 * 96;                       // one h tile, fragment-ordered rows
+constexpr int LSTM_SMEM_MAX = LSTM_SMEM + (LSTM_MAX_WARPS / 2) * 2 * LSTM_HTILE;
 
 // Epilogue constants of one hidden block j for quad position c (columns 8j + 2c, +1 of
 // every gate): gate[q] = {dqx0, dqx1, b0, b1}, dqh[0] = {q0: dqh0, dqh1, q1: dqh0, dqh1},
 // dqh[1] = the same for q2, q3.  Six LDS.128 per hidden block.
 struct __align__(16) LstmEpi { float4 gate[4]; float4 dqh[2]; };
 
+__device__ __forceinline__ void named_barrier(int id, int nthreads) {
+    asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(nthreads) : "memory");
+}
+
+template <int S>
 __global__ void __launch_bounds__(LSTM_MAX_WARPS * 32, 1)
 lstm_kernel(const int8_t *__restrict__ x, int8_t *__restrict__ y, int N, int Tp, int reverse,
             const uint8_t *__restrict__ frag, const float *__restrict__ epi, float inv_sh) {
+    constexpr int JB = 12 / S;               // hidden blocks per warp (even: whole h words)
+    constexpr int NW = JB / 2;               // h words per row this warp produces
+    static_assert(12 % S == 0 && JB % 2 == 0, "S must be 1, 2, 3 or 6");
+
     extern __shared__ __align__(16) uint8_t smem_raw[];
     const uint4 *s_w = reinterpret_cast<const uint4 *>(smem_raw);       // [12][4][3][32] {x, h}
     const LstmEpi *s_e = reinterpret_cast<const LstmEpi *>(smem_raw + W8A8F_LSTM_FRAG_BYTES);
@@ -304,14 +324,18 @@ lstm_kernel(const int8_t *__restrict__ x, int8_t *__restrict__ y, int N, int Tp,
     __syncthreads();
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
-    const int row0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;
-    if (row0 >= N) return;
+    const int grp = warp / S, ws = warp % S;                 // group = tile; warp within it
+    const int row0 = (blockIdx.x * ((blockDim.x >> 5) / S) + grp) * 16;
+    if (row0 >= N) return;                                   // whole groups leave together
     const int ra = row0 + g, rb = ra + 8;
     const bool va = ra < N, vb = rb < N;
+    const int j0 = ws * JB;                                  // first hidden block of this warp
+    uint8_t *s_h = smem_raw + LSTM_SMEM + grp * 2 * LSTM_HTILE;   // [2][16 rows][96 B] (S > 1)
+    (void)s_h;
 
-    float cs[12][4];
+    float cs[JB][4];
 #pragma unroll
-    for (int j = 0; j < 12; ++j)
+    for (int j = 0; j < JB; ++j)
 #pragma unroll
         for (int e = 0; e < 4; ++e) cs[j][e] = 0.0f;
     uint32_t ha[6] = {}, hb[6] = {};             // h_{t-1} codes, rows g and g+8 (A operand)
@@ -335,9 +359,10 @@ lstm_kernel(const int8_t *__restrict__ x, int8_t *__restrict__ y, int N, int Tp,
         load_row(x + ((int64_t)t * N + rb) * 96, vb, c, xb);
 #endif
 
-        uint32_t na[6] = {}, nb[6] = {};         // h_t codes
+        uint32_t na[NW] = {}, nb[NW] = {};       // h_t codes of this warp's hidden blocks
 #pragma unroll
-        for (int j = 0; j < 12; ++j) {           // hidden block: units 8j .. 8j+7, all 4 gates
+        for (int jj = 0; jj < JB; ++jj) {        // hidden block j: units 8j .. 8j+7, all 4 gates
+            const int j = j0 + jj;
             int ax[4][4] = {}, ah[4][4] = {};
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
@@ -371,30 +396,59 @@ lstm_kernel(const int8_t *__restrict__ x, int8_t *__restrict__ y, int N, int Tp,
                 const float fg = sigmoid_tanh(gate[1][e]);
                 const float gg = tanh_approx(gate[2][e]);
                 const float og = sigmoid_tanh(gate[3][e]);
-                cs[j][e] = __fadd_rn(__fmul_rn(fg, cs[j][e]), __fmul_rn(ig, gg));
-                hc[e] = h_code_bits(__fmul_rn(og, tanh_approx(cs[j][e])), inv_sh);
+                cs[jj][e] = __fadd_rn(__fmul_rn(fg, cs[jj][e]), __fmul_rn(ig, gg));
+                hc[e] = h_code_bits(__fmul_rn(og, tanh_approx(cs[jj][e])), inv_sh);
             }
             // codes of units (2c, 2c+1) for rows g and g+8 -> 16-bit halves of the h words
+            // (j0 is even, so j & 1 == jj & 1)
             const uint32_t pa = __byte_perm(hc[0], hc[1], 0x0040), pb = __byte_perm(hc[2], hc[3], 0x0040);
-            if (j & 1) {
-                na[j >> 1] = __byte_perm(na[j >> 1], pa, 0x5410);
-                nb[j >> 1] = __byte_perm(nb[j >> 1], pb, 0x5410);
+            if (jj & 1) {
+                na[jj >> 1] = __byte_perm(na[jj >> 1], pa, 0x5410);
+                nb[jj >> 1] = __byte_perm(nb[jj >> 1], pb, 0x5410);
             } else {
-                na[j >> 1] = pa & 0xFFFFu;
-                nb[j >> 1] = pb & 0xFFFFu;
+                na[jj >> 1] = pa & 0xFFFFu;
+                nb[jj >> 1] = pb & 0xFFFFu;
             }
         }
-        if (va) store_row(y + ((int64_t)t * N + ra) * 96, c, na);
-        if (vb) store_row(y + ((int64_t)t * N + rb) * 96, c, nb);
+        if constexpr (S == 1) {
+            if (va) store_row(y + ((int64_t)t * N + ra) * 96, c, na);
+            if (vb) store_row(y + ((int64_t)t * N + rb) * 96, c, nb);
+#pragma unroll
+            for (int i = 0; i < 6; ++i) {
+                ha[i] = na[i];
+                hb[i] = nb[i];
+            }
+        } else {
+            // Publish this warp's words of h_t, wait for the group, read back all of h_t.
+            // Buffer step & 1: a warp only rewrites it two steps later, after the next barrier,
+            // by which time every warp of the group has finished reading it.
+            uint8_t *hbuf = s_h + (step & 1) * LSTM_HTILE;
+#pragma unroll
+            for (int i = 0; i < NW; ++i) {
+                *reinterpret_cast<uint32_t *>(hbuf + g * 96 + 24 * c + 4 * (ws * NW + i)) = na[i];
+                *reinterpret_cast<uint32_t *>(hbuf + (g + 8) * 96 + 24 * c + 4 * (ws * NW + i)) = nb[i];
+            }
+            named_barrier(1 + grp, S * 32);
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                const uint2 va2 = *reinterpret_cast<const uint2 *>(hbuf + g * 96 + 24 * c + 8 * i);
+                const uint2 vb2 = *reinterpret_cast<const uint2 *>(hbuf + (g + 8) * 96 + 24 * c + 8 * i);
+                ha[2 * i] = va2.x; ha[2 * i + 1] = va2.y;
+                hb[2 * i] = vb2.x; hb[2 * i + 1] = vb2.y;
+            }
+            // the 16 rows of y_t are contiguous: 96 16-byte pieces, split over the group
+            uint4 *yt = reinterpret_cast<uint4 *>(y + ((int64_t)t * N + row0) * 96);
+            const uint4 *ht = reinterpret_cast<const uint4 *>(hbuf);
+            for (int k = ws * 32 + lane; k < LSTM_HTILE / 16; k += S * 32)
+                if (row0 + k / 6 < N) yt[k] = ht[k];
+        }
+#if W8A8F_LSTM_PREFETCH
 #pragma unroll
         for (int i = 0; i < 6; ++i) {
-            ha[i] = na[i];
-            hb[i] = nb[i];
-#if W8A8F_LSTM_PREFETCH
             xa[i] = nxa[i];
             xb[i] = nxb[i];
-#endif
         }
+#endif
     }
 }
 
@@ -486,6 +540,7 @@ void put_bfrag(uint8_t *dst, int n_base, int ks, F at) {
 }
 
 struct DeviceInfo { int sms = 0; bool attrs = false; };
+int g_lstm_force_split = -1;      // -1: not read yet; 0: automatic; 1, 2, 3, 6: forced
 DeviceInfo g_dev[64];
 
 DeviceInfo &device_info() {
@@ -494,7 +549,10 @@ DeviceInfo &device_info() {
     DeviceInfo &d = g_dev[dev & 63];
     if (!d.attrs) {
         cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
-        cudaFuncSetAttribute(lstm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, LSTM_SMEM);
+        cudaFuncSetAttribute(lstm_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, LSTM_SMEM);
+        cudaFuncSetAttribute(lstm_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, LSTM_SMEM_MAX);
+        cudaFuncSetAttribute(lstm_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, LSTM_SMEM_MAX);
+        cudaFuncSetAttribute(lstm_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, LSTM_SMEM_MAX);
         cudaFuncSetAttribute(frontend_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)sizeof(FrontSmem));
         d.attrs = true;
@@ -578,16 +636,57 @@ extern "C" int w8a8f_frontend(const void *x, int8_t *out, int N, int T,
     return (int)cudaGetLastError();
 }
 
+// Warps per tile (S) for a batch of `tiles` 16-chunk tiles on `sms` SMs, from the tiles each SM
+// must hold, t = ceil(tiles / sms), with one CTA of <= LSTM_MAX_WARPS warps per SM:
+//   t <= 1                  S = 6: one tile per SM, shortest per-step critical path
+//   t <= LSTM_MAX_WARPS / 2 S = 2: still one wave, half the serial work per step
+//   more                    S = 1: the original throughput layout.  (S = 2 measured within
+//                           +-10% of it here, inside thermal noise; SLORADO_W8A8_LSTM_SPLIT=2
+//                           tries it on other GPUs.)
+static int lstm_split(int tiles, int sms) {
+    if (g_lstm_force_split < 0) {
+        const char *e = getenv("SLORADO_W8A8_LSTM_SPLIT");
+        const int v = e ? atoi(e) : 0;
+        g_lstm_force_split = (v == 1 || v == 2 || v == 3 || v == 6) ? v : 0;
+    }
+    if (g_lstm_force_split > 0) return g_lstm_force_split;
+    const int t = (tiles + sms - 1) / sms;
+    if (t <= 1) return 6;
+    if (t <= LSTM_MAX_WARPS / 2) return 2;
+    return 1;
+}
+
+template <int S>
+static void launch_lstm(int tiles, int sms, const int8_t *x, int8_t *y, int N, int Tp, int reverse,
+                        const uint8_t *frag, const float *epi, float inv_sh, cudaStream_t stream) {
+    // tiles per CTA: at most LSTM_MAX_WARPS / S; as few waves as that allows, and the tiles
+    // spread evenly over every CTA of every wave (no half-empty last wave)
+    const int max_gpc = LSTM_MAX_WARPS / S;
+    const int waves = (tiles + sms * max_gpc - 1) / (sms * max_gpc);
+    const int gpc = (tiles + sms * waves - 1) / (sms * waves);
+    const int grid = (tiles + gpc - 1) / gpc;
+    const int smem = LSTM_SMEM + (S > 1 ? gpc * 2 * LSTM_HTILE : 0);
+    lstm_kernel<S><<<grid, gpc * S * 32, smem, stream>>>(x, y, N, Tp, reverse, frag, epi, inv_sh);
+}
+
+// Force the LSTM split (1, 2, 3 or 6 warps per tile); 0 restores the automatic choice.
+// For tests and benchmarks; the environment variable SLORADO_W8A8_LSTM_SPLIT does the same.
+extern "C" void w8a8f_lstm_force_split(int split) {
+    g_lstm_force_split = (split == 1 || split == 2 || split == 3 || split == 6) ? split : 0;
+}
+
 extern "C" int w8a8f_lstm(const int8_t *x, int8_t *y, int N, int Tp, int reverse,
                           const uint8_t *frag, const float *epi, float inv_sh, void *stream) {
     if (N <= 0 || Tp <= 0) return 0;
     DeviceInfo &d = device_info();
     const int tiles = (N + 15) / 16;
-    int wpc = (tiles + d.sms - 1) / d.sms;
-    wpc = wpc < 1 ? 1 : (wpc > LSTM_MAX_WARPS ? LSTM_MAX_WARPS : wpc);
-    const int grid = (tiles + wpc - 1) / wpc;
-    lstm_kernel<<<grid, wpc * 32, LSTM_SMEM, (cudaStream_t)stream>>>(x, y, N, Tp, reverse, frag, epi,
-                                                                     inv_sh);
+    const cudaStream_t s = (cudaStream_t)stream;
+    switch (lstm_split(tiles, d.sms)) {
+        case 6: launch_lstm<6>(tiles, d.sms, x, y, N, Tp, reverse, frag, epi, inv_sh, s); break;
+        case 3: launch_lstm<3>(tiles, d.sms, x, y, N, Tp, reverse, frag, epi, inv_sh, s); break;
+        case 2: launch_lstm<2>(tiles, d.sms, x, y, N, Tp, reverse, frag, epi, inv_sh, s); break;
+        default: launch_lstm<1>(tiles, d.sms, x, y, N, Tp, reverse, frag, epi, inv_sh, s); break;
+    }
     return (int)cudaGetLastError();
 }
 
