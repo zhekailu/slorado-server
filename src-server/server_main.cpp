@@ -18,15 +18,10 @@
 #include <vector>
 
 #include "slorado.h"
-#include "basecall.h"
-#include "torchbox.h"
 #include "error.h"
 #include "misc.h"
 #include "socket.h"
 #include "protocol.h"
-
-/* defined in src/slorado.cpp but not declared in a header */
-void postprocess_signal(core_t* core, db_t* db, int32_t i);
 
 #define DEFAULT_PORT 9500
 #define DEFAULT_MAX_REQUEST_MIB 256
@@ -55,7 +50,7 @@ typedef struct {
     double load;        // chunks -> runner input tensor, summed over runners
     double h2d;         // input tensor host -> device copy, summed over runners
     double inference;   // model forward pass, summed over runners
-    double reshape;     // scores transpose to TNC before decode, summed over runners
+    double transpose;   // scores transpose to TNC before decode, summed over runners (TSV column reshape_ms)
     double decode;      // CRF beam-search decode of the scores, summed over runners
     double postprocess;
     double fastq;
@@ -80,7 +75,7 @@ static struct option long_options[] = {
     {"port", required_argument, 0, 0},               //13
     {0, 0, 0, 0}};
 
-static void print_help_msg(FILE *fp_help, opt_t opt) {
+static void print_help_msg(FILE *fp_help, slorado_opt_t opt) {
     fprintf(fp_help, "usage: slorado-server --model FILE [--port INT] [options]\n");
     fprintf(fp_help, "required arguments:\n");
     fprintf(fp_help, "  --model FILE                the basecaller model to run.\n");
@@ -109,52 +104,19 @@ static double monotime(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* slorado's per-runner counters are cumulative; diffing them around basecall_db()
+/* slorado's per-runner counters are cumulative; diffing them around slorado_process_db()
    gives this batch's share. Summed over runners, so with one device it is wall time. */
-static runner_stat_t runner_times(const core_t *core) {
+static runner_stat_t runner_times(const slorado_core_t *core) {
     runner_stat_t sum;
     memset(&sum, 0, sizeof(sum));
     for (const runner_stat_t *ts : *core->runner_stats) {
         sum.time_accept += ts->time_accept;
-        sum.time_h2d += ts->time_h2d;
+        sum.time_h2d_transfer += ts->time_h2d_transfer;
         sum.time_infer += ts->time_infer;
-        sum.time_reshape += ts->time_reshape;
+        sum.time_transpose += ts->time_transpose;
         sum.time_decode += ts->time_decode;
     }
     return sum;
-}
-
-/* init_core() insists on opening a slow5 file, so hand it a header-only BLOW5
-   and close it straight after. Keeps using upstream init_core as-is. */
-static core_t *init_server_core(opt_t opt, char *model, double realtime0) {
-    const char *tmpdir = getenv("TMPDIR");
-    if (tmpdir == NULL || tmpdir[0] == '\0') tmpdir = "/tmp";
-    std::string path_str = std::string(tmpdir) + "/slorado-server-XXXXXX.blow5";
-    std::vector<char> path(path_str.begin(), path_str.end());
-    path.push_back('\0');
-
-    int fd = mkstemps(path.data(), strlen(".blow5"));
-    if (fd < 0) {
-        ERROR("Could not create a temporary file in %s: %s", tmpdir, strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-    close(fd);
-
-    slow5_file_t *sp = slow5_open(path.data(), "w");
-    if (sp == NULL || slow5_hdr_write(sp) < 0) {
-        ERROR("Could not write the placeholder BLOW5 %s", path.data());
-        unlink(path.data());
-        exit(EXIT_FAILURE);
-    }
-    slow5_close(sp);
-
-    opt.batch_size = 1; // non-zero skips estimate_bytes_per_read; resized per batch
-    core_t *core = init_core(path.data(), opt, model, realtime0);
-
-    slow5_close(core->sp);
-    core->sp = NULL;
-    unlink(path.data());
-    return core;
 }
 
 static void append_fastq(std::string &out, const char *read_id, const std::string &seq, const std::string &qstr) {
@@ -171,7 +133,7 @@ static void append_fastq(std::string &out, const char *read_id, const std::strin
 
 /* Basecall recs and append one FASTQ record per read, in request order, to msg.
    Takes ownership of recs and frees them. */
-static void basecall_batch(core_t *core, std::vector<slow5_rec_t *> &recs, const server_opt_t *sopt,
+static void basecall_batch(slorado_core_t *core, std::vector<slow5_rec_t *> &recs, const server_opt_t *sopt,
                            std::string &msg, batch_timing_t *t) {
     const int32_t n = (int32_t)recs.size();
 
@@ -185,32 +147,28 @@ static void basecall_batch(core_t *core, std::vector<slow5_rec_t *> &recs, const
     t->reads = n;
     t->basecalled_reads = n_call;
 
-    db_t *db = NULL;
+    slorado_db_t *db = NULL;
     if (n_call > 0) {
-        core->opt.batch_size = n_call;
-        db = init_db(core);
+        core->opt.batch_size = n_call; // slorado_init_db sizes the batch from this
+        db = slorado_init_db(core);
         for (int32_t i = 0; i < n; i++) {
             if (db_index[i] >= 0) db->slow5_rec[db_index[i]] = recs[i]; // db now owns it
         }
         db->n_rec = n_call;
 
-        // the same stages as process_db(), minus parse_single (records are already decoded)
-        double a = monotime();
-        work_db(core, db, preprocess_signal_db);
-        double b = monotime();
+        // preprocess -> basecall -> postprocess; records are already decoded so slorado skips parsing.
+        // Stage times come from slorado's cumulative counters (realtime(), not monotime()).
+        double pre0 = core->time_preproc, post0 = core->time_postproc;
         runner_stat_t s0 = runner_times(core);
-        basecall_db(core, db);
+        slorado_process_db(core, db);
         runner_stat_t s1 = runner_times(core);
-        double c = monotime();
-        work_db(core, db, postprocess_signal);
-        double d = monotime();
-        t->preprocess = b - a;
+        t->preprocess = core->time_preproc - pre0;
         t->load = s1.time_accept - s0.time_accept;
-        t->h2d = s1.time_h2d - s0.time_h2d;
+        t->h2d = s1.time_h2d_transfer - s0.time_h2d_transfer;
         t->inference = s1.time_infer - s0.time_infer;
-        t->reshape = s1.time_reshape - s0.time_reshape;
+        t->transpose = s1.time_transpose - s0.time_transpose;
         t->decode = s1.time_decode - s0.time_decode;
-        t->postprocess = d - c;
+        t->postprocess = core->time_postproc - post0;
     }
 
     double e = monotime();
@@ -226,7 +184,7 @@ static void basecall_batch(core_t *core, std::vector<slow5_rec_t *> &recs, const
     }
     t->fastq = monotime() - e;
 
-    if (db != NULL) free_db(db);
+    if (db != NULL) slorado_free_db(db);
     for (int32_t i = 0; i < n; i++) {
         if (db_index[i] < 0) slow5_rec_free(recs[i]);
     }
@@ -253,14 +211,14 @@ static void write_timing(FILE *fp, const batch_timing_t *t) {
     fprintf(fp, "%u\t%u\t%u\t%u\t%lu\t%lu\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
             t->batch, t->fragments, t->reads, t->basecalled_reads, (unsigned long)t->samples, (unsigned long)t->bases,
             t->recv * 1e3, t->unpack * 1e3, t->preprocess * 1e3, t->load * 1e3, t->h2d * 1e3,
-            t->inference * 1e3, t->reshape * 1e3, t->decode * 1e3,
+            t->inference * 1e3, t->transpose * 1e3, t->decode * 1e3,
             t->postprocess * 1e3,
             t->fastq * 1e3, t->send * 1e3, t->total * 1e3);
 }
 
 /* Serve one client until it disconnects. Returns 0 on an orderly disconnect,
    -1 when the connection has to be dropped. */
-static int serve(int fd, core_t *core, const server_opt_t *sopt) {
+static int serve(int fd, slorado_core_t *core, const server_opt_t *sopt) {
     bool active = false;                 // a batch is being accumulated
     uint32_t active_batch = 0, active_fragments = 0, expected_fragment = 0;
     bool has_failed = false;             // remaining fragments of a rejected batch are dropped quietly
@@ -367,8 +325,8 @@ int main(int argc, char* argv[]) {
     int32_t c = -1;
     FILE *fp_help = stderr;
 
-    opt_t opt;
-    init_opt(&opt); // initialise options to defaults
+    slorado_opt_t opt;
+    slorado_init_opt(&opt); // initialise options to defaults
 
     server_opt_t sopt;
     sopt.max_request = (uint32_t)DEFAULT_MAX_REQUEST_MIB << 20;
@@ -485,7 +443,8 @@ int main(int argc, char* argv[]) {
     }
 
     // load the model once; it is reused for every client and batch
-    core_t *core = init_server_core(opt, model, realtime0);
+    // no slow5 file: reads arrive over the socket, so batch_size is set per request
+    slorado_core_t *core = slorado_init_core(opt, model, NULL);
 
     fprintf(stderr, "\nslorado-server version %s\n", SLORADO_VERSION);
     fprintf(stderr, "model path:         %s\n", model);
@@ -517,6 +476,6 @@ int main(int argc, char* argv[]) {
 
     TCP_server_shutdown(listenfd);
     if (sopt.timing != NULL) fclose(sopt.timing);
-    free_core(core, opt);
+    slorado_free_core(core, opt);
     return EXIT_FAILURE;
 }

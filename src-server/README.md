@@ -5,10 +5,11 @@ readfish-timing's `NetworkCaller` (`readfish network-latency`), so readfish
 needs no changes. It basecalls every batch with slorado's own pipeline and
 returns one FASTQ record per read.
 
-All server code lives in `src-server/`. It calls slorado's public batch API
-(`init_core`, `init_db`, `work_db`, `preprocess_signal_db`, `basecall_db`,
-`postprocess_signal`, `free_db`), and nothing under `src/` is modified. That
-lets upstream slorado updates merge without conflicts.
+All server code lives in `src-server/`. It uses only slorado's public API
+(`slorado_init_opt`, `slorado_init_core`, `slorado_init_db`,
+`slorado_process_db`, `slorado_free_db`, `slorado_free_core`). The core is
+created with no SLOW5 file, because reads arrive over the socket. The only
+change under `src/` is the W8A8 model hook in `torchbox.cpp`.
 
 ## Build
 
@@ -38,7 +39,7 @@ server adds three of its own:
 
 | option | default | meaning |
 |---|---|---|
-| `--timing FILE` | off | Per-batch server-side TSV: recv, unpack, preprocess, load, copyToGPU, inference, reshape, decode, postprocess, fastq, send, and total ms. `unpack_ms` is request payload → SLOW5 records; `load_ms` copies chunks into the input tensor, `copyToGPU_ms` is the host→device copy, `inference_ms` the model forward pass, `reshape_ms` the score transpose, and `decode_ms` the CRF decode. |
+| `--timing FILE` | off | Per-batch server-side TSV: recv, unpack, preprocess, load, copyToGPU, inference, reshape, decode, postprocess, fastq, send, and total ms. `unpack_ms` is request payload → SLOW5 records; `load_ms` copies chunks into the input tensor, `copyToGPU_ms` is the host→device copy, `inference_ms` the model forward pass, `reshape_ms` the score transpose (slorado's `time_transpose`), and `decode_ms` the CRF decode. |
 | `--min-samples INT` | 100 | Reads shorter than this are not basecalled and come back with an empty sequence. |
 | `--max-request-mib INT` | 256 | Largest request frame accepted. |
 
