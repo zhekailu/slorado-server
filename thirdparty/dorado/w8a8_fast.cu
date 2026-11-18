@@ -640,9 +640,8 @@ extern "C" int w8a8f_frontend(const void *x, int8_t *out, int N, int T,
 // must hold, t = ceil(tiles / sms), with one CTA of <= LSTM_MAX_WARPS warps per SM:
 //   t <= 1                  S = 6: one tile per SM, shortest per-step critical path
 //   t <= LSTM_MAX_WARPS / 2 S = 2: still one wave, half the serial work per step
-//   more                    S = 1: the original throughput layout.  (S = 2 measured within
-//                           +-10% of it here, inside thermal noise; SLORADO_W8A8_LSTM_SPLIT=2
-//                           tries it on other GPUs.)
+//   more                    S = 1: the original layout and launch, unchanged.  On Orin Nano
+//                           S = 2 is 11-12% slower for t = 5..8 (one S = 1 wave).
 static int lstm_split(int tiles, int sms) {
     if (g_lstm_force_split < 0) {
         const char *e = getenv("SLORADO_W8A8_LSTM_SPLIT");
@@ -659,11 +658,12 @@ static int lstm_split(int tiles, int sms) {
 template <int S>
 static void launch_lstm(int tiles, int sms, const int8_t *x, int8_t *y, int N, int Tp, int reverse,
                         const uint8_t *frag, const float *epi, float inv_sh, cudaStream_t stream) {
-    // tiles per CTA: at most LSTM_MAX_WARPS / S; as few waves as that allows, and the tiles
-    // spread evenly over every CTA of every wave (no half-empty last wave)
-    const int max_gpc = LSTM_MAX_WARPS / S;
-    const int waves = (tiles + sms * max_gpc - 1) / (sms * max_gpc);
-    const int gpc = (tiles + sms * waves - 1) / (sms * waves);
+    // tiles per CTA: spread over all SMs, at most LSTM_MAX_WARPS / S (the original launch for
+    // S = 1).  Not spread evenly over waves: a CTA's time is a step function of its warps (one
+    // per SM sub-partition is nearly free, measured on Orin: 1-4 tiles ~24 ms, 5-8 ~39 ms), so
+    // full CTAs plus one small last CTA (39 + 24) beat two medium ones (39 + 39).
+    int gpc = (tiles + sms - 1) / sms;
+    gpc = gpc < 1 ? 1 : (gpc > LSTM_MAX_WARPS / S ? LSTM_MAX_WARPS / S : gpc);
     const int grid = (tiles + gpc - 1) / gpc;
     const int smem = LSTM_SMEM + (S > 1 ? gpc * 2 * LSTM_HTILE : 0);
     lstm_kernel<S><<<grid, gpc * S * 32, smem, stream>>>(x, y, N, Tp, reverse, frag, epi, inv_sh);
