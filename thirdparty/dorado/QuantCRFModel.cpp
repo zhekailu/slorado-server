@@ -238,6 +238,14 @@ QuantCRFModelImpl::QuantCRFModelImpl(const CRFModelConfig &config, const torch::
     for (auto &e : events_) check_rc(cudaEventCreate(reinterpret_cast<cudaEvent_t *>(&e)), "cudaEventCreate");
 }
 
+static thread_local void *tl_scores_out = nullptr;
+static thread_local size_t tl_scores_out_bytes = 0;
+
+void quant_crf_set_scores_out(void *ptr, size_t bytes) {
+    tl_scores_out = ptr;
+    tl_scores_out_bytes = ptr ? bytes : 0;
+}
+
 torch::Tensor QuantCRFModelImpl::forward(const torch::Tensor &x_in) {
     TORCH_CHECK(x_in.is_cuda() && x_in.scalar_type() == torch::kHalf && x_in.dim() == 3 && x_in.size(1) == 1,
                 "QuantCRFModel expects [N, 1, T] FP16 CUDA input, got ", x_in.sizes(), " ",
@@ -258,7 +266,10 @@ torch::Tensor QuantCRFModelImpl::forward(const torch::Tensor &x_in) {
     auto act = torch::empty({Tp, N, 96}, x.options().dtype(torch::kInt8));
     auto act_next = torch::empty_like(act);
     // linear + clamp writes FP16 scores in TNC order
-    auto scores = torch::empty({Tp, N, 256}, x.options());
+    const size_t scores_bytes = (size_t)Tp * N * 256 * sizeof(at::Half);
+    auto scores = tl_scores_out && tl_scores_out_bytes >= scores_bytes
+                      ? torch::from_blob(tl_scores_out, {Tp, N, 256}, x.options())
+                      : torch::empty({Tp, N, 256}, x.options());
 
     // Stage times come from events, so the stages run back to back with one wait at the end
     // (the caller synchronises after forward anyway).
@@ -297,6 +308,8 @@ QuantCRFModelImpl::QuantCRFModelImpl(const CRFModelConfig &config, const torch::
     ERROR("W8A8 model %s needs slorado built with cuda=1", config.model_path.c_str());
     exit(EXIT_FAILURE);
 }
+
+void quant_crf_set_scores_out(void *, size_t) {}
 
 torch::Tensor QuantCRFModelImpl::forward(const torch::Tensor &x) {
     TORCH_CHECK(false, "QuantCRFModel needs slorado built with cuda=1");

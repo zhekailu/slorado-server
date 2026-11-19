@@ -28,14 +28,19 @@ SOFTWARE.
 
 ******************************************************************************/
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <stdlib.h>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "torchbox.h"
 #include "basecall.h"
 #include "misc.h"
 #include "error.h"
+#include "dorado/QuantCRFModel.h"
 
 #ifdef USE_GPU
 #include <c10/core/DeviceGuard.h>
@@ -175,6 +180,100 @@ static void accept_chunk(const int num_chunks, const basecall_chunk_t *chunk, ru
     runner->input_tensor.index_put_({num_chunks, 0}, {input_slice});
 }
 
+/* accept_chunk for a whole batch: copy each chunk's signal into row i of the input tensor, tiling it
+   (repeat-pad) when shorter than chunk_size exactly as accept_chunk does, but with memcpy, spread over
+   nthreads. accept_chunk spends ~33 us per chunk on torch dispatch (slice, unsqueeze, repeat, concat,
+   index_put_), ~100 ms for 3000 chunks, to move ~10 KB each.
+   Returns false, having copied nothing, unless every signal is a contiguous 1-D CPU tensor of the input
+   tensor's dtype (index_put_ would also convert dtype); the caller then falls back to accept_chunk. */
+static bool accept_chunks_fast(const std::vector<basecall_chunk_t *> &chunks, runner_t *runner, int64_t chunk_size, int nthreads) {
+    torch::Tensor &input = runner->input_tensor;
+    if (!input.device().is_cpu() || !input.is_contiguous() || input.dim() != 3 || input.size(1) != 1 ||
+        input.size(2) != chunk_size || input.size(0) < (int64_t)chunks.size()) {
+        return false;
+    }
+    for (const basecall_chunk_t *chunk : chunks) {
+        const torch::Tensor &sig = chunk->read_dat->scaled_signal;
+        if (!sig.device().is_cpu() || sig.dim() != 1 || !sig.is_contiguous() || sig.scalar_type() != input.scalar_type()) return false;
+        if ((int64_t)chunk->input_offset >= sig.size(0)) return false;
+    }
+
+    const size_t es = input.element_size();
+    char *const dst_base = (char *)input.data_ptr();
+    auto copy_range = [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            const torch::Tensor &sig = chunks[i]->read_dat->scaled_signal;
+            const int64_t off = (int64_t)chunks[i]->input_offset;
+            const int64_t len = std::min<int64_t>(chunk_size, sig.size(0) - off);
+            const char *src = (const char *)sig.data_ptr() + off * es;
+            char *dst = dst_base + i * chunk_size * es;
+            // the slice, then whole repeats of it, then its first (chunk_size % len) samples
+            for (int64_t done = 0; done < chunk_size; done += len) {
+                std::memcpy(dst + done * es, src, std::min<int64_t>(len, chunk_size - done) * es);
+            }
+        }
+    };
+
+    const size_t n = chunks.size();
+    if (nthreads < 1) nthreads = 1;
+    if ((size_t)nthreads > n) nthreads = (int)n;
+    const size_t step = (n + nthreads - 1) / nthreads;
+    std::vector<std::thread> workers;
+    for (int t = 1; t < nthreads; ++t) {
+        const size_t b = t * step, e = std::min(n, b + step);
+        if (b < e) workers.emplace_back(copy_range, b, e);
+    }
+    copy_range(0, std::min(n, step));
+    for (auto &w : workers) w.join();
+    return true;
+}
+
+/* Decoder output for chunks [begin, end), whose rows start at row 0 of moves/sequence/qstring. */
+static void write_chunk_results(
+    const std::vector<basecall_chunk_t *> &chunks,
+    const size_t begin,
+    const size_t end,
+    const int T,
+    const uint8_t *moves,
+    const char *sequence,
+    const char *qstring
+) {
+    for (size_t chunk = begin; chunk < end; ++chunk) {
+        size_t idx = (chunk - begin) * T;
+        chunks[chunk]->moves = std::vector<uint8_t>(moves + idx, moves + idx + T);
+        size_t num_bases = 0;
+        for (auto move: chunks[chunk]->moves) {
+            num_bases += move;
+        }
+        if (num_bases > (size_t)T) {
+            ERROR("num bases %zu greater than number of timesteps %d", num_bases, T);
+            exit(EXIT_FAILURE);
+        }
+        chunks[chunk]->seq = std::string(sequence + idx, num_bases);
+        chunks[chunk]->qstring = std::string(qstring + idx, num_bases);
+
+        size_t seq_size = strlen(chunks[chunk]->seq.c_str());
+        size_t qstr_size = strlen(chunks[chunk]->qstring.c_str());
+
+        if (seq_size == 0) {
+            ERROR("%s", "empty sequence returned by decoder");
+            exit(EXIT_FAILURE);
+        }
+
+        if (qstr_size == 0) {
+            ERROR("%s", "empty qstring returned by decoder");
+            exit(EXIT_FAILURE);
+        }
+        
+        if (seq_size != qstr_size) {
+            ERROR("mismatch sequence size of %zu with qstring size of %zu", seq_size, qstr_size);
+            ERROR("seq: %s", chunks[chunk]->seq.c_str());
+            ERROR("qstring: %s", chunks[chunk]->qstring.c_str());
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
 static void call_chunks(
     const core_t* core,
     const std::vector<basecall_chunk_t *> &chunks,
@@ -241,40 +340,7 @@ static void call_chunks(
 
     LOG_DEBUG("%s", "writing to chunks");
 
-    for (size_t chunk = 0; chunk < chunks.size(); ++chunk) {
-        size_t idx = chunk * T;
-        chunks[chunk]->moves = std::vector<uint8_t>(moves + idx, moves + idx + T);
-        size_t num_bases = 0;
-        for (auto move: chunks[chunk]->moves) {
-            num_bases += move;
-        }
-        if (num_bases > (size_t)T) {
-            ERROR("num bases %zu greater than number of timesteps %d", num_bases, T);
-            exit(EXIT_FAILURE);
-        }
-        chunks[chunk]->seq = std::string(sequence + idx, num_bases);
-        chunks[chunk]->qstring = std::string(qstring + idx, num_bases);
-
-        size_t seq_size = strlen(chunks[chunk]->seq.c_str());
-        size_t qstr_size = strlen(chunks[chunk]->qstring.c_str());
-
-        if (seq_size == 0) {
-            ERROR("%s", "empty sequence returned by decoder");
-            exit(EXIT_FAILURE);
-        }
-
-        if (qstr_size == 0) {
-            ERROR("%s", "empty qstring returned by decoder");
-            exit(EXIT_FAILURE);
-        }
-        
-        if (seq_size != qstr_size) {
-            ERROR("mismatch sequence size of %zu with qstring size of %zu", seq_size, qstr_size);
-            ERROR("seq: %s", chunks[chunk]->seq.c_str());
-            ERROR("qstring: %s", chunks[chunk]->qstring.c_str());
-            exit(EXIT_FAILURE);
-        }
-    }
+    write_chunk_results(chunks, 0, chunks.size(), T, moves, sequence, qstring);
     ts->time_decode += realtime();
 
     LOG_DEBUG("%s", "done writing to chunks");
@@ -399,6 +465,227 @@ static void mod_call_chunks(
 //     int nthreads = core->opt.num_thread / core->runners->size();
 }
 
+#ifdef USE_GPU
+/* ---- CPU beam-search pipeline (integrated GPUs only) ---------------------------------------------
+ * A batch of n >= 2S chunks (S = --pipeline) is split into K = n / S equal sub-batches. The calling thread runs, for each sub-batch,
+ * H2D -> model -> GPU scans (backward, forward + posterior); a second thread then runs the beam search,
+ * per-base qualities and sequence for that sub-batch on the CPU (openfish_beam_cpu_fp16), while the
+ * calling thread already runs the GPU work of the next sub-batch. Only the last sub-batch's CPU work
+ * is not hidden behind GPU work.
+ * The model's scores and the scans' outputs go to pinned host memory mapped into the GPU (zero copy):
+ * on a Jetson, GPU kernels read and write it at device-memory speed and the CPU reads it cached. Two
+ * slots, so the GPU fills one while the CPU reads the other.
+ * The output is not byte-identical to openfish_decode_gpu (a different beam search implementation),
+ * but it is the same for any sub-batch size, since every stage is per chunk. */
+static int g_pipe_chunks = 0;   // smallest sub-batch in chunks, 0 = off
+static int g_pipe_threads = 1;  // CPU beam-search threads
+
+typedef struct {
+    void *scores_h, *scores_d;  // fp16 [T][rows][C]
+    float *bwd_h, *bwd_d;       // [rows][T + 1][num_states]
+    float *post_h, *post_d;
+} pipe_slot_t;
+
+typedef struct {
+    pipe_slot_t slot[2];
+    size_t rows = 0, T = 0, C = 0, num_states = 0;
+    size_t scores_bytes = 0, guide_bytes = 0;  // per slot
+} pipe_state_t;
+
+static std::mutex g_pipe_mu;
+static std::vector<pipe_state_t *> g_pipe;  // per runner
+
+void basecall_set_pipeline(int sub_chunks, int cpu_threads) {
+    if (sub_chunks > 0 && !openfish_gpu_is_integrated()) {
+        WARNING("%s", "--pipeline needs a GPU that shares memory with the CPU (e.g. Jetson); disabled");
+        sub_chunks = 0;
+    }
+    g_pipe_chunks = sub_chunks > 0 ? sub_chunks : 0;
+    g_pipe_threads = cpu_threads > 0 ? cpu_threads : 1;
+}
+
+int basecall_pipeline_chunks(void) { return g_pipe_chunks; }
+
+static void pipe_free_slots(pipe_state_t *ps) {
+    for (auto &sl : ps->slot) {
+        openfish_host_free(sl.scores_h);
+        openfish_host_free(sl.bwd_h);
+        openfish_host_free(sl.post_h);
+        sl = pipe_slot_t{};
+    }
+    ps->rows = 0;
+}
+
+static pipe_state_t *pipe_state(int runner_idx) {
+    std::lock_guard<std::mutex> lock(g_pipe_mu);
+    if ((size_t)runner_idx >= g_pipe.size()) g_pipe.resize(runner_idx + 1, nullptr);
+    if (!g_pipe[runner_idx]) g_pipe[runner_idx] = new pipe_state_t();
+    return g_pipe[runner_idx];
+}
+
+/* slots for `rows` chunks of T x C scores; false if pinned memory ran out */
+static bool pipe_alloc_slots(pipe_state_t *ps, size_t rows, size_t T, size_t C, size_t num_states) {
+    if (ps->rows >= rows && ps->T == T && ps->C == C && ps->num_states == num_states) return true;
+    pipe_free_slots(ps);
+    const size_t scores_bytes = rows * T * C * sizeof(uint16_t);
+    const size_t guide_bytes = rows * (T + 1) * num_states * sizeof(float);
+    for (auto &sl : ps->slot) {
+        void *d;
+        sl.scores_h = openfish_host_alloc(scores_bytes, &sl.scores_d);
+        sl.bwd_h = (float *)openfish_host_alloc(guide_bytes, &d);
+        sl.bwd_d = (float *)d;
+        sl.post_h = (float *)openfish_host_alloc(guide_bytes, &d);
+        sl.post_d = (float *)d;
+        if (!sl.scores_h || !sl.bwd_h || !sl.post_h) {
+            pipe_free_slots(ps);
+            return false;
+        }
+    }
+    ps->rows = rows;
+    ps->T = T;
+    ps->C = C;
+    ps->num_states = num_states;
+    ps->scores_bytes = scores_bytes;
+    ps->guide_bytes = guide_bytes;
+    LOG_DEBUG("pipeline: 2 pinned slots of %zu chunks, %.1f MB each", rows, (scores_bytes + 2 * guide_bytes) / 1e6);
+    return true;
+}
+
+/* Sub-batch sizes for a batch of n chunks: equal, each S to 2S - 1 chunks; empty when the batch is too
+   small to pipeline (n < 2 * S), as splitting a small batch makes the GPU slower than the beam search
+   it hides. (A taper, big sub-batches first and a small last one, was measured on an Orin Nano and was
+   slower: the CPU's big early jobs slow GPU inference more than the shorter tail saves.) */
+static std::vector<size_t> pipe_schedule(size_t n, size_t S) {
+    std::vector<size_t> sz;
+    if (S == 0 || n < 2 * S) return sz;
+    const size_t K = n / S;
+    for (size_t k = 0; k < K; ++k) sz.push_back(n * (k + 1) / K - n * k / K);
+    return sz;
+}
+
+/* false (nothing done) if the batch is too small to pipeline */
+static bool call_chunks_pipelined(
+    const core_t* core,
+    const std::vector<basecall_chunk_t *> &chunks,
+    const int runner_idx
+) {
+    const size_t n = chunks.size();
+    const size_t S = (size_t)g_pipe_chunks;
+    const std::vector<size_t> sizes = pipe_schedule(n, S);
+    if (sizes.empty()) return false;
+
+    runner_t* runner = (*core->runners)[runner_idx];
+    runner_stat_t* ts = (*core->runner_stats)[runner_idx];
+    c10::DeviceGuard device_guard(runner->tensor_opts.device());
+    torch::InferenceMode guard;
+
+    pipe_state_t *ps = pipe_state(runner_idx);
+    const size_t K = sizes.size();
+    const size_t max_rows = *std::max_element(sizes.begin(), sizes.end());
+    const int state_len = core->model_config->state_len;
+    const size_t num_states = (size_t)1 << (2 * state_len);
+    const int cpu_threads = g_pipe_threads;
+    const bool log = getenv("SLORADO_PIPE_LOG") != NULL;
+
+    std::thread cpu_job;
+    std::vector<double> t_infer(K), t_scan(K), t_wait(K), t_cpu(K);
+
+    size_t e = 0;
+    for (size_t k = 0; k < K; ++k) {
+        const size_t b = e, nk = sizes[k];
+        e = b + nk;
+
+        ts->time_h2d_transfer -= realtime();
+        auto input = runner->input_tensor.narrow(0, b, nk).to(runner->tensor_opts.device());
+        torch::cuda::synchronize(runner->device_idx);
+        ts->time_h2d_transfer += realtime();
+
+        // the model writes its scores straight into this sub-batch's slot when they fit (W8A8 model,
+        // slots allocated); otherwise into a tensor of its own, copied into the slot below
+        pipe_slot_t &sl = ps->slot[k & 1];
+        double t0 = realtime();
+        ts->time_infer -= t0;
+        quant_crf_set_scores_out(ps->rows >= nk ? sl.scores_d : nullptr, ps->rows >= nk ? nk * ps->T * ps->C * 2 : 0);
+        auto scores = runner->module->forward(input);
+        quant_crf_set_scores_out(nullptr, 0);
+        torch::cuda::synchronize(runner->device_idx);
+        double t1 = realtime();
+        ts->time_infer += t1;
+        t_infer[k] = t1 - t0;
+
+        ts->time_transpose -= realtime();
+        auto scores_TNC = scores.transpose(0, 1).contiguous();
+        const int T = scores_TNC.size(0);
+        const int C = scores_TNC.size(2);
+        if (scores_TNC.scalar_type() != torch::kHalf) {
+            ERROR("%s", "--pipeline needs a model with fp16 scores");
+            exit(EXIT_FAILURE);
+        }
+        if (scores_TNC.data_ptr() != sl.scores_d) {
+            if (ps->rows < max_rows || ps->T != (size_t)T || ps->C != (size_t)C) {
+                // (re)allocating frees both slots: the CPU must be done with the other one
+                if (cpu_job.joinable()) cpu_job.join();
+                if (!pipe_alloc_slots(ps, std::max(max_rows, 2 * S - 1), T, C, num_states)) {
+                    ERROR("%s", "--pipeline: could not allocate pinned host memory; try a smaller --pipeline");
+                    exit(EXIT_FAILURE);
+                }
+            }
+            auto dst = torch::from_blob(sl.scores_d, {T, (int64_t)nk, C}, scores_TNC.options());
+            dst.copy_(scores_TNC);
+            torch::cuda::synchronize(runner->device_idx);
+        }
+        scores = torch::Tensor();
+        scores_TNC = torch::Tensor();
+        ts->time_transpose += realtime();
+
+        // GPU scans into the slot
+        t0 = realtime();
+        ts->time_decode -= t0;
+        openfish_scan_gpu(T, (int)nk, C, sl.scores_d, state_len, &core->decoder_opts, sl.bwd_d, sl.post_d);
+        t1 = realtime();
+        t_scan[k] = t1 - t0;
+
+        // the previous sub-batch's CPU work must finish before its slot is reused (next iteration)
+        if (cpu_job.joinable()) cpu_job.join();
+        double t2 = realtime();
+        ts->time_decode += t2;
+        t_wait[k] = t2 - t1;
+
+        const pipe_slot_t *slp = &sl;
+        cpu_job = std::thread([core, &chunks, &t_cpu, slp, k, b, e, nk, T, C, state_len, cpu_threads]() {
+            const double c0 = realtime();
+            uint8_t *moves;
+            char *sequence;
+            char *qstring;
+            openfish_beam_cpu_fp16(T, (int)nk, C, cpu_threads, slp->scores_h, slp->bwd_h, slp->post_h, state_len,
+                                   &core->decoder_opts, &moves, &sequence, &qstring);
+            write_chunk_results(chunks, b, e, T, moves, sequence, qstring);
+            free(moves);
+            free(sequence);
+            free(qstring);
+            t_cpu[k] = realtime() - c0;
+        });
+    }
+
+    const double t0 = realtime();
+    ts->time_decode -= t0;
+    cpu_job.join();
+    const double t1 = realtime();
+    ts->time_decode += t1;
+
+    if (log) {
+        double si = 0, ss = 0, sw = 0, sc = 0;
+        for (size_t k = 0; k < K; ++k) { si += t_infer[k]; ss += t_scan[k]; sw += t_wait[k]; sc += t_cpu[k]; }
+        fprintf(stderr, "[pipeline] n=%zu K=%zu (first %zu, last %zu) threads=%d  infer %.1f  scans %.1f  wait %.1f  cpu %.1f (last %.1f)  tail %.1f ms\n",
+                n, K, sizes[0], sizes[K - 1], cpu_threads, si * 1e3, ss * 1e3, sw * 1e3, sc * 1e3, t_cpu[K - 1] * 1e3, (t1 - t0) * 1e3);
+    }
+    return true;
+}
+#else
+void basecall_set_pipeline(int, int) {}
+int basecall_pipeline_chunks(void) { return 0; }
+#endif
+
 void basecall_chunks(
     const core_t* core,
     const int runner_idx,
@@ -410,13 +697,19 @@ void basecall_chunks(
 
     LOG_DEBUG("%s", "accepting chunks");
     ts->time_accept -= realtime();
-    for (size_t i = 0; i < chunks.size(); ++i) {
-        accept_chunk(i, chunks[i], runner, chunk_size);
+    const int load_threads = core->opt.num_thread / (int)core->runners->size();
+    if (!accept_chunks_fast(chunks, runner, (int64_t)chunk_size, load_threads)) {
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            accept_chunk(i, chunks[i], runner, chunk_size);
+        }
     }
     ts->time_accept += realtime();
     LOG_DEBUG("%s", "done accepting chunks");
 
     ts->time_basecall -= realtime();
+#ifdef USE_GPU
+    if (!(g_pipe_chunks > 0 && runner->device != "cpu" && call_chunks_pipelined(core, chunks, runner_idx)))
+#endif
     call_chunks(core, chunks, runner_idx);
     ts->time_basecall += realtime();
 }

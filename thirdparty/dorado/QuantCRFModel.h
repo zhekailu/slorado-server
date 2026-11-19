@@ -22,6 +22,12 @@ using namespace torch::nn;
 // true if model_path/quantization.json declares "format": "slorado-w8a8-gpu-v1"
 bool is_w8a8_model(const std::string &model_path);
 
+// Make forward() calls on the calling thread write their scores into `ptr` (device-accessible,
+// at least `bytes` long, e.g. pinned host memory on a Jetson) instead of a new tensor, when they
+// fit; nullptr restores the default. The returned tensor then views that memory, so the caller
+// owns its lifetime. Used by the CPU beam-search pipeline to avoid copying the scores.
+void quant_crf_set_scores_out(void *ptr, size_t bytes);
+
 ModuleHolder<AnyModule> load_quant_lstm_model(const CRFModelConfig &model_config, const torch::TensorOptions &options, lstm_stats_t *model_stats);
 
 struct QuantCRFModelImpl : torch::nn::Module {

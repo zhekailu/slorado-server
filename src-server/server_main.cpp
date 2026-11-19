@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "slorado.h"
+#include "basecall.h"
 #include "error.h"
 #include "misc.h"
 #include "socket.h"
@@ -26,6 +27,7 @@
 #define DEFAULT_PORT 9500
 #define DEFAULT_MAX_REQUEST_MIB 256
 #define DEFAULT_MIN_SAMPLES 100
+#define MAX_BEAM_WIDTH_OPT 32   /* openfish's MAX_BEAM_WIDTH; openfish rejects anything wider */
 
 /* readfish sends "RF-<read id>" but looks results up by the bare read id */
 #define READFISH_ID_PREFIX "RF-"
@@ -34,6 +36,9 @@ typedef struct {
     uint32_t max_request;   // max frame size in bytes
     uint32_t min_samples;   // reads shorter than this get an empty record
     FILE *timing;           // per-batch timing TSV, or NULL
+    int beam_width;         // CRF beam search width; 0 keeps openfish's default
+    int pipeline;           // CPU beam-search pipeline sub-batch size in chunks; 0 = off
+    int pipeline_threads;   // its CPU threads; 0 = one less than the online CPUs
 } server_opt_t;
 
 /* server-side time spent on one logical batch, from receipt of fragment 0 to the reply being sent */
@@ -73,6 +78,9 @@ static struct option long_options[] = {
     {"timing", required_argument, 0, 0},             //11
     {"model", required_argument, 0, 0},              //12
     {"port", required_argument, 0, 0},               //13
+    {"beam-width", required_argument, 0, 0},         //14
+    {"pipeline", required_argument, 0, 0},           //15
+    {"pipeline-threads", required_argument, 0, 0},   //16
     {0, 0, 0, 0}};
 
 static void print_help_msg(FILE *fp_help, slorado_opt_t opt) {
@@ -94,6 +102,11 @@ static void print_help_msg(FILE *fp_help, slorado_opt_t opt) {
     fprintf(fp_help, "  --max-request-mib INT       largest request frame accepted [%d]\n", DEFAULT_MAX_REQUEST_MIB);
     fprintf(fp_help, "  --min-samples INT           reads shorter than this are returned with an empty sequence [%d]\n", DEFAULT_MIN_SAMPLES);
     fprintf(fp_help, "  --timing FILE               write per-batch server-side timings as TSV\n");
+    fprintf(fp_help, "  --beam-width INT            CRF beam search width, 1-%d [openfish default, %zu]\n", MAX_BEAM_WIDTH_OPT, openfish_decoder_default_opts().beam_width);
+    fprintf(fp_help, "  --pipeline INT              integrated GPUs (Jetson): split batches of >= 2*INT chunks into sub-batches of\n"
+                     "                              INT to 2*INT-1 chunks and run beam search, qualities and sequence on the CPU,\n"
+                     "                              overlapped with the GPU (250 suits an Orin Nano) [0 = off]\n");
+    fprintf(fp_help, "  --pipeline-threads INT      CPU threads for --pipeline [online CPUs - 1]\n");
 }
 
 /* Per-batch timings use a monotonic clock: slorado's realtime() is gettimeofday(),
@@ -332,6 +345,9 @@ int main(int argc, char* argv[]) {
     sopt.max_request = (uint32_t)DEFAULT_MAX_REQUEST_MIB << 20;
     sopt.min_samples = DEFAULT_MIN_SAMPLES;
     sopt.timing = NULL;
+    sopt.beam_width = 0;
+    sopt.pipeline = 0;
+    sopt.pipeline_threads = 0;
     const char *timing_path = NULL;
     char *model = NULL;
     long port = DEFAULT_PORT;
@@ -394,6 +410,23 @@ int main(int argc, char* argv[]) {
             timing_path = optarg;
         } else if (c == 0 && longindex == 12) { // model
             model = optarg;
+        } else if (c == 0 && longindex == 14) { // beam width
+            char *end = NULL;
+            long bw = strtol(optarg, &end, 10);
+            if (*end != '\0' || bw < 1 || bw > MAX_BEAM_WIDTH_OPT) {
+                ERROR("--beam-width should be between 1 and %d. You entered %s", MAX_BEAM_WIDTH_OPT, optarg);
+                exit(EXIT_FAILURE);
+            }
+            sopt.beam_width = (int)bw;
+        } else if (c == 0 && (longindex == 15 || longindex == 16)) { // pipeline, pipeline-threads
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (*end != '\0' || v < 0 || v > 1000000) {
+                ERROR("--%s should be a non-negative integer. You entered %s", long_options[longindex].name, optarg);
+                exit(EXIT_FAILURE);
+            }
+            if (longindex == 15) sopt.pipeline = (int)v;
+            else sopt.pipeline_threads = (int)v;
         } else if (c == 0 && longindex == 13) { // port
             char *end = NULL;
             port = strtol(optarg, &end, 10);
@@ -445,6 +478,15 @@ int main(int argc, char* argv[]) {
     // load the model once; it is reused for every client and batch
     // no slow5 file: reads arrive over the socket, so batch_size is set per request
     slorado_core_t *core = slorado_init_core(opt, model, NULL);
+    if (sopt.beam_width > 0) core->decoder_opts.beam_width = (size_t)sopt.beam_width;
+    if (sopt.pipeline > 0) {
+        int threads = sopt.pipeline_threads;
+        if (threads <= 0) {
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            threads = ncpu > 1 ? (int)ncpu - 1 : 1;
+        }
+        basecall_set_pipeline(sopt.pipeline, threads);
+    }
 
     fprintf(stderr, "\nslorado-server version %s\n", SLORADO_VERSION);
     fprintf(stderr, "model path:         %s\n", model);
@@ -455,6 +497,10 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "no. threads:        %d\n", opt.num_thread);
     fprintf(stderr, "overlap:            %d\n", core->opt.overlap);
     fprintf(stderr, "min samples:        %u\n", sopt.min_samples);
+    fprintf(stderr, "beam width:         %zu\n", core->decoder_opts.beam_width);
+    if (basecall_pipeline_chunks() > 0) {
+        fprintf(stderr, "pipeline:           CPU beam search, sub-batches of %d+ chunks\n", basecall_pipeline_chunks());
+    }
     fprintf(stderr, "timing output:      %s\n", timing_path == NULL ? "none" : timing_path);
     fprintf(stderr, "model loaded in %.3f s\n\n", realtime() - realtime0);
 
